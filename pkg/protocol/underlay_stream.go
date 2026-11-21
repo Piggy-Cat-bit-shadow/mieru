@@ -64,6 +64,22 @@ type StreamUnderlay struct {
 }
 
 var _ Underlay = &StreamUnderlay{}
+var _ receiveQuotaSetter = &StreamUnderlay{}
+
+// StreamUnderlayOptions configures optional receive-side policy of a stream
+// underlay.
+type StreamUnderlayOptions struct {
+	// Exclusive declares that this underlay carries a single session. Only an
+	// exclusive underlay may pause its reader for receive byte quota
+	// backpressure, because pausing a shared reader would stall every other
+	// session multiplexed on the same connection.
+	Exclusive bool
+
+	// ReceiveByteQuota is the maximum number of unread payload bytes each
+	// session may hold before the reader stops reading the connection. Zero
+	// disables the byte quota.
+	ReceiveByteQuota int64
+}
 
 // NewStreamUnderlay connects to the remote address "addr" on the network
 // with packet encryption.
@@ -80,6 +96,7 @@ func NewStreamUnderlay(
 	mtu int,
 	block cipher.BlockCipher,
 	trafficPattern *appctlpb.TrafficPattern,
+	options StreamUnderlayOptions,
 ) (*StreamUnderlay, error) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
@@ -108,6 +125,8 @@ func NewStreamUnderlay(
 		block:              block,
 		sessionCleanTicker: time.NewTicker(sessionCleanInterval),
 	}
+	t.exclusive = options.Exclusive
+	t.recvQuota.Store(options.ReceiveByteQuota)
 	return t, nil
 }
 
@@ -208,7 +227,7 @@ func (t *StreamUnderlay) RunEventLoop(ctx context.Context) error {
 			t.cleanSessions()
 		default:
 		}
-		seg, err := t.readOneSegment()
+		seg, err := t.readOneSegmentContext(ctx)
 		if err != nil {
 			// If the underlay is closing, return gracefully.
 			select {
@@ -375,7 +394,14 @@ func (t *StreamUnderlay) onCloseSession(seg *segment) error {
 	return nil
 }
 
+// readOneSegment reads and decodes one segment without a cancellation source.
+// The event loop uses readOneSegmentContext so that a receive quota wait can be
+// aborted by the mux context.
 func (t *StreamUnderlay) readOneSegment() (*segment, error) {
+	return t.readOneSegmentContext(context.Background())
+}
+
+func (t *StreamUnderlay) readOneSegmentContext(ctx context.Context) (*segment, error) {
 	var firstRead bool
 	var err error
 
@@ -462,11 +488,24 @@ func (t *StreamUnderlay) readOneSegment() (*segment, error) {
 	// Read payload and construct segment.
 	p := decryptedMeta[0]
 	var seg *segment
+	var reserved *Session
+	var reservedBytes int64
+	var waited bool
 	if isSessionProtocol(protocolType(p)) {
 		ss := &sessionStruct{}
 		if err := ss.Unmarshal(decryptedMeta); err != nil {
 			err = fmt.Errorf("Unmarshal() to sessionStruct failed: %w", err)
 			return nil, stderror.WrapErrorWithType(err, stderror.PROTOCOL_ERROR)
+		}
+		reserved, reservedBytes, waited, err = t.waitReceiveQuota(ctx, ss)
+		if err != nil {
+			return nil, err
+		}
+		if waited {
+			// Waiting can outlive the read deadline that was armed before the
+			// metadata read. Re-arm it so a legitimately parked payload is
+			// still readable after the application frees quota.
+			common.SetReadTimeout(t.conn, readOneSegmentTimeout)
 		}
 		seg, err = t.readSessionSegment(ss)
 	} else if isDataAckProtocol(protocolType(p)) {
@@ -475,19 +514,98 @@ func (t *StreamUnderlay) readOneSegment() (*segment, error) {
 			err = fmt.Errorf("Unmarshal() to dataAckStruct failed: %w", err)
 			return nil, stderror.WrapErrorWithType(err, stderror.PROTOCOL_ERROR)
 		}
+		reserved, reservedBytes, waited, err = t.waitReceiveQuota(ctx, das)
+		if err != nil {
+			return nil, err
+		}
+		if waited {
+			common.SetReadTimeout(t.conn, readOneSegmentTimeout)
+		}
 		seg, err = t.readDataAckSegment(das)
 	} else {
 		err = fmt.Errorf("unable to handle unknown protocol %d", p)
 		return nil, stderror.WrapErrorWithType(err, stderror.PROTOCOL_ERROR)
 	}
 	if err != nil {
+		if reserved != nil {
+			reserved.releaseReceivePayload(reservedBytes)
+		}
 		return nil, err
+	}
+	if reserved != nil {
+		if int64(len(seg.payload)) != reservedBytes {
+			// Keeping the reservation would leak quota forever, so return it
+			// and treat the mismatch as a protocol error.
+			reserved.releaseReceivePayload(reservedBytes)
+			err = fmt.Errorf("decoded payload length %d differs from reserved %d", len(seg.payload), reservedBytes)
+			return nil, stderror.WrapErrorWithType(err, stderror.PROTOCOL_ERROR)
+		}
+		seg.recvOwner = reserved
 	}
 	if authentication.Valid() {
 		seg.serverUserPolicy = authentication.Policy()
 		seg.serverUserAuthentication = authentication
 	}
 	return seg, nil
+}
+
+// waitReceiveQuota pauses the stream reader while the session that owns the
+// incoming payload has exhausted its receive byte quota. The payload length is
+// known from the just-decoded metadata and the quota is checked before the
+// payload is allocated or read.
+//
+// It returns the reserved session and byte count when the caller must attach
+// the reservation to the decoded segment. A nil session with waited=true means
+// the session closed while parked: the caller still reads the payload to keep
+// the stream framed and lets dispatch drop it.
+func (t *StreamUnderlay) waitReceiveQuota(ctx context.Context, meta metadata) (*Session, int64, bool, error) {
+	if !t.exclusive || t.recvQuota.Load() <= 0 {
+		return nil, 0, false, nil
+	}
+	var n int64
+	var sessionID uint32
+	switch m := meta.(type) {
+	case *dataAckStruct:
+		if isAckProtocol(m.Protocol()) {
+			// ACK frames never carry application payload.
+			return nil, 0, false, nil
+		}
+		if isLowEntropyProtocol(m.Protocol()) {
+			n = int64(m.extractedPayloadLen)
+		} else {
+			n = int64(m.payloadLen)
+		}
+		sessionID = m.sessionID
+	case *sessionStruct:
+		if m.Protocol() != openSessionRequest && m.Protocol() != openSessionResponse {
+			// Close frames never carry application payload.
+			return nil, 0, false, nil
+		}
+		n = int64(m.payloadLen)
+		sessionID = m.sessionID
+	default:
+		return nil, 0, false, nil
+	}
+	if n <= 0 {
+		return nil, 0, false, nil
+	}
+	value, ok := t.sessionMap.Load(sessionID)
+	if !ok {
+		return nil, 0, false, nil
+	}
+	s := value.(*Session)
+	if s.recvQuota.Load() <= 0 {
+		return nil, 0, false, nil
+	}
+	switch s.waitReceivePayload(ctx, t.done, n) {
+	case receiveAdmitted:
+		return s, n, true, nil
+	case receiveSessionClosed:
+		return nil, 0, true, nil
+	default:
+		err := fmt.Errorf("underlay is closing while waiting for receive quota")
+		return nil, 0, true, stderror.WrapErrorWithType(err, stderror.NETWORK_ERROR)
+	}
 }
 
 func (t *StreamUnderlay) readSessionSegment(ss *sessionStruct) (*segment, error) {

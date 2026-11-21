@@ -72,6 +72,9 @@ type Mux struct {
 	username        string
 	password        []byte
 	multiplexFactor int
+	// receiveByteQuota is the per-session payload byte receive quota applied
+	// to exclusive stream underlays. Protected by mu.
+	receiveByteQuota int64
 
 	// ---- server only fields ----
 	serverUsers          serveruser.Registry
@@ -273,6 +276,37 @@ func (m *Mux) SetClientMultiplexFactor(n int) *Mux {
 	}
 	m.multiplexFactor = mathext.Max(n, 0)
 	log.Infof("Mux multiplexing factor is set to %d", m.multiplexFactor)
+	return m
+}
+
+// SetReceiveByteQuota sets the maximum number of unread plaintext payload
+// bytes per session. Zero disables the quota.
+//
+// The quota is enforced only on exclusive stream underlays, that is, when
+// client multiplexing is disabled: pausing a shared stream reader would stall
+// every other session multiplexed on the same connection. It applies to
+// underlays created after this call and to the sessions already attached to
+// existing underlays, so a resource-pressure policy can tighten or relax it at
+// runtime.
+func (m *Mux) SetReceiveByteQuota(bytes int64) *Mux {
+	if !m.isClient {
+		panic("Can't set receive byte quota in server mux")
+	}
+	if bytes < 0 || (bytes > 0 && bytes < MinReceiveByteQuota) {
+		panic(fmt.Sprintf("Receive byte quota %d is invalid: 0 disables it, otherwise it must be at least %d", bytes, MinReceiveByteQuota))
+	}
+	m.mu.Lock()
+	m.receiveByteQuota = bytes
+	underlays := make([]Underlay, len(m.underlays))
+	copy(underlays, m.underlays)
+	m.mu.Unlock()
+
+	for _, underlay := range underlays {
+		if setter, ok := underlay.(receiveQuotaSetter); ok {
+			setter.setReceiveByteQuota(bytes)
+		}
+	}
+	log.Infof("Mux receive byte quota is set to %d", bytes)
 	return m
 }
 
@@ -684,12 +718,20 @@ func (m *Mux) serverWrapTCPConn(rawConn net.Conn, mtu int, trafficPattern *appct
 func (m *Mux) newUnderlay(ctx context.Context) (Underlay, error) {
 	var underlay Underlay
 	var trafficPattern *appctlpb.TrafficPattern
+	var streamOptions StreamUnderlayOptions
 
 	m.mu.Lock()
 	i := mrand.Intn(len(m.endpoints))
 	p := m.endpoints[i]
 	if m.trafficPattern != nil {
 		trafficPattern = m.trafficPattern.Effective()
+	}
+	// With multiplexing disabled every session gets its own underlay, so the
+	// reader may pause for that session's receive byte quota. A shared
+	// underlay must never take that pause.
+	if m.multiplexFactor == 0 {
+		streamOptions.Exclusive = true
+		streamOptions.ReceiveByteQuota = m.receiveByteQuota
 	}
 	m.mu.Unlock()
 
@@ -705,7 +747,7 @@ func (m *Mux) newUnderlay(ctx context.Context) (Underlay, error) {
 		if trafficPattern != nil {
 			block.SetNoncePattern(trafficPattern.GetNonce())
 		}
-		underlay, err = NewStreamUnderlay(ctx, m.dialer, m.resolver, m.clientDNSConfig, p.RemoteAddr().Network(), p.RemoteAddr().String(), p.MTU(), block, trafficPattern)
+		underlay, err = NewStreamUnderlay(ctx, m.dialer, m.resolver, m.clientDNSConfig, p.RemoteAddr().Network(), p.RemoteAddr().String(), p.MTU(), block, trafficPattern, streamOptions)
 		if err != nil {
 			return nil, fmt.Errorf("NewTCPUnderlay() failed: %v", err)
 		}

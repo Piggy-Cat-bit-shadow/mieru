@@ -110,6 +110,20 @@ type ClientConfig struct {
 
 	// Optional DNS configurations.
 	DNSConfig *apicommon.ClientDNSConfig
+
+	// ReceiveByteQuota is the maximum number of unread plaintext payload
+	// bytes the protocol may buffer for one session. When the quota is
+	// reached the client stops reading from the server until the application
+	// reads the buffered data, which bounds the memory held by the receive
+	// path and applies TCP back pressure to the peer.
+	//
+	// The quota is enforced on exclusive stream underlays only, so it
+	// requires MultiplexingLevel_MULTIPLEXING_OFF. A value of 0 disables it.
+	// A positive value must be at least protocol.MinReceiveByteQuota, which
+	// guarantees that a single maximum-size segment can always be admitted.
+	// protocol.DefaultReceiveByteQuota is the value recommended for a
+	// memory-bounded client.
+	ReceiveByteQuota int64
 }
 
 // NewClient creates a blank mieru client with no client config.

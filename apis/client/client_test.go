@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	pb "github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
+	"github.com/enfein/mieru/v3/pkg/protocol"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -43,6 +44,46 @@ func TestStoreRejectProfileDialer(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "client profile dialer is not supported by client API") {
 		t.Fatalf("Store() error = %q, want profile dialer rejection", err.Error())
+	}
+}
+
+func TestStoreReceiveByteQuota(t *testing.T) {
+	muxOff := &pb.MultiplexingConfig{Level: pb.MultiplexingLevel_MULTIPLEXING_OFF.Enum()}
+	muxLow := &pb.MultiplexingConfig{Level: pb.MultiplexingLevel_MULTIPLEXING_LOW.Enum()}
+	tests := []struct {
+		name         string
+		quota        int64
+		multiplexing *pb.MultiplexingConfig
+		wantErr      string
+	}{
+		{name: "disabled", quota: 0, multiplexing: muxLow},
+		{name: "negative", quota: -1, multiplexing: muxOff, wantErr: "receive byte quota -1 is invalid"},
+		{name: "below minimum", quota: protocol.MinReceiveByteQuota - 1, multiplexing: muxOff, wantErr: "is invalid"},
+		{name: "minimum", quota: protocol.MinReceiveByteQuota, multiplexing: muxOff},
+		{name: "shared underlay", quota: 4 * protocol.MinReceiveByteQuota, multiplexing: muxLow, wantErr: "requires multiplexing off"},
+		{name: "default multiplexing", quota: 4 * protocol.MinReceiveByteQuota, wantErr: "requires multiplexing off"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			profile := generateClientProfile(t)
+			profile.Multiplexing = test.multiplexing
+			err := NewClient().Store(&ClientConfig{Profile: profile, ReceiveByteQuota: test.quota})
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Store() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Store() error = nil, want error containing %q", test.wantErr)
+			}
+			if !errors.Is(err, ErrInvalidClientConfig) {
+				t.Fatalf("Store() error = %v, want ErrInvalidClientConfig", err)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Store() error = %q, want error containing %q", err.Error(), test.wantErr)
+			}
+		})
 	}
 }
 

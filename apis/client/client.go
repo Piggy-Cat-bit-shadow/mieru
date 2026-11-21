@@ -82,6 +82,12 @@ func (mc *mieruClient) Store(config *ClientConfig) error {
 	if err := appctlcommon.ValidateClientConfigSingleProfile(config.Profile); err != nil {
 		return fmt.Errorf("%w: %s", ErrInvalidClientConfig, err.Error())
 	}
+	if quota := config.ReceiveByteQuota; quota < 0 || (quota > 0 && quota < protocol.MinReceiveByteQuota) {
+		return fmt.Errorf("%w: receive byte quota %d is invalid: 0 disables it, otherwise it must be at least %d", ErrInvalidClientConfig, quota, protocol.MinReceiveByteQuota)
+	}
+	if config.ReceiveByteQuota > 0 && config.Profile.GetMultiplexing().GetLevel() != appctlpb.MultiplexingLevel_MULTIPLEXING_OFF {
+		return fmt.Errorf("%w: receive byte quota requires multiplexing off, because only an exclusive stream underlay can pause its reader without stalling other sessions", ErrInvalidClientConfig)
+	}
 	mc.config = config
 	return nil
 }
@@ -97,6 +103,7 @@ func (mc *mieruClient) Start() error {
 	if err != nil {
 		return err
 	}
+	mux.SetReceiveByteQuota(mc.config.ReceiveByteQuota)
 	mc.mux = mux
 	mc.running.Store(true)
 	return nil
