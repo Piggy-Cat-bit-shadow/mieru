@@ -47,6 +47,19 @@ const (
 	// Maximum number of segments in a queue or buffer.
 	segmentTreeCapacity = 4096
 
+	// MinReceiveByteQuota is the minimum receive byte quota that can be
+	// configured for a session. A segment declares at most math.MaxUint16
+	// plaintext payload bytes, so the 64 KiB floor always admits one
+	// maximum-size segment into an empty quota. This floor is what rules out a
+	// first segment that can never enter the receive queue.
+	MinReceiveByteQuota = 64 * 1024
+
+	// DefaultReceiveByteQuota is the receive byte quota recommended for a
+	// memory-bounded client. It bounds the unread payload of one exclusive
+	// stream session while leaving enough room for socket buffering that the
+	// loopback receive throughput stays close to an unbounded session.
+	DefaultReceiveByteQuota = 256 * 1024
+
 	// Use a smaller number in sendQueue to produce earlier write backpressure.
 	segmentSendQueueTreeCapacity = 1024
 
@@ -151,6 +164,32 @@ type Session struct {
 	ackDeadline            atomic.Int64  // time to send the pending ack requested by ackOnDataRecv, in microseconds since Unix epoch
 	unreadBuf              []byte        // payload removed from the recvQueue that haven't been read by application
 
+	// recvQuota is the maximum number of unread payload bytes this session
+	// may hold before the owning exclusive stream underlay stops reading from
+	// the network. 0 disables the byte quota. It is updated through the Mux
+	// that owns the session so a resource-pressure policy can change it
+	// without a process-global setter.
+	recvQuota atomic.Int64
+	// unreadPayloadBytes is the number of received plaintext payload bytes
+	// that this session owns but the application has not read yet. It covers
+	// payload parked in recvChan, recvBuf, recvQueue and unreadBuf. It counts
+	// logical payload bytes, not allocated capacity: a partially read segment
+	// keeps its whole backing array until the remainder is consumed.
+	unreadPayloadBytes atomic.Int64
+	// recvChanSpace is signalled when a receive segment leaves recvChan, to
+	// wake a blocked segment delivery.
+	recvChanSpace chan struct{}
+	// recvQuotaSpace is signalled when unreadPayloadBytes decreases or the
+	// quota changes, to wake a blocked receive admission. Keeping it separate
+	// from recvChanSpace prevents a delivery and a quota admission from
+	// stealing each other's wakeup.
+	recvQuotaSpace chan struct{}
+	// recvMu makes "the session accepts receive segments" and "the session is
+	// closed for receive" one decision. It is never held while waiting, so it
+	// can't deadlock Read or Close.
+	recvMu     sync.Mutex
+	recvClosed bool
+
 	rttStat            *congestion.RTTStats
 	cubicSendAlgorithm *congestion.CubicSendAlgorithm
 	remoteWindowSize   atomic.Uint32
@@ -214,6 +253,8 @@ func newSessionWithServerUserPolicy(
 		recvBuf:                   newSegmentTree(segmentTreeCapacity),
 		recvQueue:                 newSegmentTree(segmentTreeCapacity),
 		recvChan:                  make(chan *segment, segmentChanCapacity),
+		recvChanSpace:             make(chan struct{}, 1),
+		recvQuotaSpace:            make(chan struct{}, 1),
 		packetOutputWakeup:        make(chan struct{}, 1),
 		rttStat:                   rttStat,
 		cubicSendAlgorithm:        congestion.NewCubicSendAlgorithm(minWindowSize, maxWindowSize),
@@ -234,6 +275,128 @@ func (s *Session) String() string {
 		return fmt.Sprintf("Session{id=%v}", s.id)
 	}
 	return fmt.Sprintf("Session{id=%v, local=%v, remote=%v}", s.id, s.LocalAddr(), s.RemoteAddr())
+}
+
+// UnreadPayloadBytes returns the number of received plaintext payload bytes
+// that the application has not read yet.
+//
+// The value covers payload bytes owned by the session in recvChan, recvBuf,
+// recvQueue and unreadBuf. It is a logical payload count, not an allocated
+// capacity measurement: a segment that was only partially read keeps its whole
+// backing array alive until the remainder is consumed, and ciphertext,
+// padding, metadata and container overhead are not included.
+func (s *Session) UnreadPayloadBytes() int64 {
+	return s.unreadPayloadBytes.Load()
+}
+
+// setReceiveByteQuota updates the payload byte quota of this session and wakes
+// a receive admission that may be waiting for space.
+func (s *Session) setReceiveByteQuota(n int64) {
+	s.recvQuota.Store(n)
+	s.notifyRecvQuotaSpace()
+}
+
+// notifyRecvChanSpace wakes a delivery waiting for room in recvChan.
+func (s *Session) notifyRecvChanSpace() {
+	select {
+	case s.recvChanSpace <- struct{}{}:
+	default:
+	}
+}
+
+// notifyRecvQuotaSpace wakes a receive admission waiting for quota.
+func (s *Session) notifyRecvQuotaSpace() {
+	select {
+	case s.recvQuotaSpace <- struct{}{}:
+	default:
+	}
+}
+
+// tryReserveReceivePayload reserves n payload bytes without blocking. It always
+// increments unreadPayloadBytes; only a positive quota can reject it.
+func (s *Session) tryReserveReceivePayload(n int64) bool {
+	quota := s.recvQuota.Load()
+	for {
+		cur := s.unreadPayloadBytes.Load()
+		// Strict admission: the counter can never exceed the quota, so the
+		// worst case is exactly quota bytes and not quota + one segment.
+		if quota > 0 && cur+n > quota {
+			return false
+		}
+		if s.unreadPayloadBytes.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
+}
+
+// releaseReceivePayload returns n payload bytes to the quota.
+func (s *Session) releaseReceivePayload(n int64) {
+	if n <= 0 {
+		return
+	}
+	if v := s.unreadPayloadBytes.Add(-n); v < 0 {
+		// Never let a release bug surface as a negative gauge. The CAS avoids
+		// clobbering a concurrent reservation.
+		s.unreadPayloadBytes.CompareAndSwap(v, 0)
+	}
+	s.notifyRecvQuotaSpace()
+}
+
+// receiveAdmission is the result of waiting for receive quota.
+type receiveAdmission int
+
+const (
+	receiveAdmitted receiveAdmission = iota
+	receiveSessionClosed
+	receiveUnderlayAborted
+)
+
+// waitReceivePayload reserves n payload bytes, blocking while the quota is
+// exhausted. It holds no lock while waiting and creates no timer or goroutine.
+// It is woken by Read consumption, by Close, by context cancellation and by
+// the owning underlay closing.
+func (s *Session) waitReceivePayload(ctx context.Context, abort <-chan struct{}, n int64) receiveAdmission {
+	if n <= 0 {
+		return receiveAdmitted
+	}
+	for {
+		if s.tryReserveReceivePayload(n) {
+			return receiveAdmitted
+		}
+		select {
+		case <-s.recvQuotaSpace:
+			// A reader consumed payload or the quota changed.
+		case <-s.closedChan:
+			return receiveSessionClosed
+		case <-abort:
+			return receiveUnderlayAborted
+		case <-ctx.Done():
+			return receiveUnderlayAborted
+		}
+	}
+}
+
+// accountSegmentPayload starts accounting the payload of seg to this session.
+// It is a no-op when the segment was already reserved or accounted, so moving
+// the same payload between receive containers never counts it twice.
+func (s *Session) accountSegmentPayload(seg *segment) {
+	if seg == nil || seg.recvOwner != nil || len(seg.payload) == 0 {
+		return
+	}
+	seg.recvOwner = s
+	s.unreadPayloadBytes.Add(int64(len(seg.payload)))
+}
+
+// releaseSegmentPayload releases the whole payload of seg if it is still
+// accounted. It is safe to call on a segment that was never accounted and on
+// a segment whose ownership already moved to unreadBuf.
+func releaseSegmentPayload(seg *segment) {
+	if seg == nil || seg.recvOwner == nil {
+		return
+	}
+	owner := seg.recvOwner
+	seg.recvOwner = nil
+	owner.releaseReceivePayload(int64(len(seg.payload)))
 }
 
 // Read lets a user to read data from receive queue.
@@ -263,6 +426,10 @@ func (s *Session) Read(b []byte) (n int, err error) {
 		if len(s.unreadBuf) > 0 {
 			copied := copy(b[n:], s.unreadBuf)
 			n += copied
+			// unreadBuf keeps the payload accounted until the bytes are
+			// actually returned to the application, so a partial Read only
+			// returns what it copied.
+			s.releaseReceivePayload(int64(copied))
 			if copied == len(s.unreadBuf) {
 				s.unreadBuf = nil
 			} else {
@@ -282,8 +449,17 @@ func (s *Session) Read(b []byte) (n int, err error) {
 			if s.isClient && seg.metadata.Protocol() == openSessionResponse && s.isState(sessionAttached) {
 				s.forwardStateTo(sessionEstablished)
 			}
+			// Segments inserted by the receive path are already accounted;
+			// this also accounts segments inserted directly by tests.
+			s.accountSegmentPayload(seg)
 			copied := copy(b[n:], seg.payload)
 			n += copied
+			if seg.recvOwner != nil {
+				// Hand the remainder (if any) to unreadBuf, which keeps the
+				// remaining bytes accounted until they are copied out.
+				seg.recvOwner = nil
+				s.releaseReceivePayload(int64(copied))
+			}
 			if copied < len(seg.payload) {
 				s.unreadBuf = seg.payload[copied:]
 			}
@@ -713,6 +889,8 @@ func (s *Session) runInputLoop(ctx context.Context) error {
 		case <-s.closedChan:
 			return nil
 		case seg := <-s.recvChan:
+			// A delivery may be waiting for space in recvChan.
+			s.notifyRecvChanSpace()
 			if err := s.input(seg); err != nil {
 				err = fmt.Errorf("input() failed: %w", err)
 				log.Debugf("%v %v", s, err)
@@ -1043,10 +1221,12 @@ func (s *Session) input(seg *segment) error {
 	protocol := seg.Protocol()
 	if s.isClient {
 		if protocol != openSessionResponse && protocol != dataServerToClient && protocol != dataServerToClientLowEntropy && protocol != ackServerToClient && protocol != closeSessionRequest && protocol != closeSessionResponse {
+			releaseSegmentPayload(seg)
 			return stderror.ErrInvalidArgument
 		}
 	} else {
 		if protocol != openSessionRequest && protocol != dataClientToServer && protocol != dataClientToServerLowEntropy && protocol != ackClientToServer && protocol != closeSessionRequest && protocol != closeSessionResponse {
+			releaseSegmentPayload(seg)
 			return stderror.ErrInvalidArgument
 		}
 	}
@@ -1118,21 +1298,42 @@ func (s *Session) input(seg *segment) error {
 		}
 		return nil
 	} else if isAckProtocol(protocol) {
+		// ACK frames carry no application payload; a peer-supplied payload is
+		// dropped with the frame, so return any accounting it may have.
+		releaseSegmentPayload(seg)
 		return s.inputAck(seg)
 	} else if protocol == closeSessionRequest || protocol == closeSessionResponse {
+		// Close frames carry no application payload.
+		releaseSegmentPayload(seg)
 		return s.inputClose(seg)
 	}
 	return nil
 }
 
 func (s *Session) inputData(seg *segment) error {
+	// From this point on the segment payload is owned by the session. Every
+	// exit path either parks it in a receive container or releases it.
+	s.accountSegmentPayload(seg)
 	switch s.transportProtocol {
 	case common.StreamTransport:
-		// Deliver the segment directly to recvQueue.
-		if s.waitForRecvQueueSpace() {
-			if !s.recvQueue.Insert(seg) {
-				return fmt.Errorf("inputData() failed: insert %v to receive queue failed", seg)
-			}
+		// Wait outside recvMu: Close must always be able to take the lock.
+		if !s.waitForRecvQueueSpace() {
+			// The session was closed while the segment was in flight. Late
+			// input must not be republished to the application.
+			releaseSegmentPayload(seg)
+			return nil
+		}
+		s.recvMu.Lock()
+		if s.recvClosed {
+			s.recvMu.Unlock()
+			releaseSegmentPayload(seg)
+			return nil
+		}
+		inserted := s.recvQueue.Insert(seg)
+		s.recvMu.Unlock()
+		if !inserted {
+			releaseSegmentPayload(seg)
+			return fmt.Errorf("inputData() failed: insert %v to receive queue failed", seg)
 		}
 	case common.PacketTransport:
 		// Delete all previous acknowledged segments from sendBuf.
@@ -1159,28 +1360,52 @@ func (s *Session) inputData(seg *segment) error {
 		// Deliver the segment to recvBuf.
 		s.requestPacketAck()
 		if s.receiveWindowSize() <= 0 {
+			// UDP drop semantics are intentionally preserved: a segment that
+			// does not fit the receive window is dropped, not queued, and its
+			// accounting is returned immediately.
+			releaseSegmentPayload(seg)
 			if log.IsLevelEnabled(log.TraceLevel) {
 				log.Tracef("%v dropped %v because the receive window size is 0", s, seg)
 			}
 			return nil
 		}
-		if !s.recvBuf.Insert(seg) {
+		hasRecvQueueSpace := s.waitForRecvQueueSpace()
+		s.recvMu.Lock()
+		if s.recvClosed {
+			s.recvMu.Unlock()
+			releaseSegmentPayload(seg)
+			return nil
+		}
+		replaced, inserted := s.recvBuf.insertReplacing(seg)
+		if !inserted {
+			s.recvMu.Unlock()
+			releaseSegmentPayload(seg)
 			if log.IsLevelEnabled(log.TraceLevel) {
 				log.Tracef("%v dropped %v because insert to receive buffer failed", s, seg)
 			}
 			return nil
 		}
-
-		// Move segments from recvBuf to recvQueue.
-		if s.waitForRecvQueueSpace() {
-			if err := s.moveRecvBufToRecvQueue(); err != nil {
+		if replaced != nil {
+			// A duplicate or retransmitted packet replaced the queued copy.
+			// Release the replaced payload so the same logical bytes are
+			// counted exactly once.
+			releaseSegmentPayload(replaced)
+		}
+		// Move segments from recvBuf to recvQueue. This must happen under
+		// recvMu, otherwise Close could drain recvBuf between the insert and
+		// the move and strand the accounting of the inserted segment.
+		if hasRecvQueueSpace {
+			if err := s.moveRecvBufToRecvQueueLocked(); err != nil {
+				s.recvMu.Unlock()
 				return fmt.Errorf("inputData() failed: %w", err)
 			}
 		}
+		s.recvMu.Unlock()
 		// Make sure the segments moved to recvQueue are acknowledged,
 		// even if an ACK was sent while they were being processed.
 		s.requestPacketAck()
 	default:
+		releaseSegmentPayload(seg)
 		return fmt.Errorf("unsupported transport protocol %v", s.transportProtocol)
 	}
 
@@ -1392,8 +1617,11 @@ func (s *Session) closeWithError(err error) error {
 		}
 	}
 
-	// Don't clear receive buf and queue, because read is allowed after
-	// the session is closed.
+	// Stop accepting receive segments and return the accounting of payload
+	// that Read can no longer reach. Payload already in recvQueue and
+	// unreadBuf stays accounted because Read is allowed after Close and is
+	// released when the application consumes it.
+	s.closeReceive()
 	s.sendQueue.DeleteAll()
 	s.sendBuf.DeleteAll()
 	s.forwardStateTo(sessionClosed)
@@ -1401,6 +1629,39 @@ func (s *Session) closeWithError(err error) error {
 	log.Debugf("Closed %v", s)
 	metrics.CurrEstablished.Add(-1)
 	return nil
+}
+
+// closeReceive makes the session stop accepting receive segments, drains the
+// segments that are still in the delivery channel and the out-of-order receive
+// buffer (packet transport only; Read can never reach them), and releases their
+// payload accounting. It is idempotent and never waits for another lock.
+func (s *Session) closeReceive() {
+	s.recvMu.Lock()
+	defer s.recvMu.Unlock()
+	if s.recvClosed {
+		return
+	}
+	s.recvClosed = true
+
+	for {
+		select {
+		case seg := <-s.recvChan:
+			releaseSegmentPayload(seg)
+		default:
+			var orphaned []*segment
+			s.recvBuf.Ascend(func(iter *segment) bool {
+				orphaned = append(orphaned, iter)
+				return true
+			})
+			s.recvBuf.DeleteAll()
+			for _, seg := range orphaned {
+				releaseSegmentPayload(seg)
+			}
+			// A delivery may be parked waiting for recvChan space.
+			s.notifyRecvChanSpace()
+			return
+		}
+	}
 }
 
 // sendWindowSize determines how many more packets this session can send.
@@ -1433,7 +1694,9 @@ func (s *Session) waitForRecvQueueSpace() bool {
 	}
 }
 
-func (s *Session) moveRecvBufToRecvQueue() error {
+// moveRecvBufToRecvQueueLocked moves in-order segments from recvBuf to
+// recvQueue. The caller must hold recvMu.
+func (s *Session) moveRecvBufToRecvQueueLocked() error {
 	for {
 		if s.recvQueue.Remaining() <= 0 {
 			return nil
@@ -1449,11 +1712,16 @@ func (s *Session) moveRecvBufToRecvQueue() error {
 		}
 		seq, _ := seg.Seq()
 		if seq < nextRecv {
-			continue // ignore this segment
+			// Duplicate of data the application can already read. Drop it and
+			// return its accounting; it must not be counted or delivered
+			// twice.
+			releaseSegmentPayload(seg)
+			continue
 		}
 		if !s.recvQueue.Insert(seg) {
 			// Can't move to recvQueue, try insert back to recvBuf.
 			if !s.recvBuf.Insert(seg) {
+				releaseSegmentPayload(seg)
 				return fmt.Errorf("insert %v from receive queue back to receive buffer failed", seg)
 			}
 			return nil

@@ -94,6 +94,13 @@ type segment struct {
 	txTimeout time.Duration            // need to receive ACK within this duration
 	block     cipher.BlockCipher       // cipher block to encrypt or decrypt the payload
 
+	// recvOwner is the session whose unreadPayloadBytes counter includes this
+	// segment's payload. It is nil when the payload is not receive-accounted
+	// (for example, every segment produced by the send path). A segment
+	// belongs to at most one session, so the pointer also makes releasing the
+	// payload idempotent and impossible to apply to the wrong session.
+	recvOwner *Session
+
 	// serverUserPolicy is set when server-side discovery authenticates a new session.
 	serverUserPolicy serveruser.Policy
 
@@ -196,6 +203,15 @@ func newSegmentTree(capacity int) *segmentTree {
 // Insert adds a new segment to the tree.
 // It returns true if insert is successful.
 func (t *segmentTree) Insert(seg *segment) (ok bool) {
+	_, ok = t.insertReplacing(seg)
+	return ok
+}
+
+// insertReplacing adds a new segment to the tree and returns the previous
+// segment that has the same sequence number, if any. The receive buffer uses
+// the returned segment to release the accounting of a packet that is replaced
+// by a duplicate, so the same logical payload is never counted twice.
+func (t *segmentTree) insertReplacing(seg *segment) (prev *segment, ok bool) {
 	t.checkNil(seg)
 	t.checkSeq(seg)
 	t.checkProtocolType(seg)
@@ -204,9 +220,10 @@ func (t *segmentTree) Insert(seg *segment) (ok bool) {
 
 	if t.tr.Len() >= t.cap {
 		t.notifyNotEmpty()
-		return false
+		return nil, false
 	}
-	prev, replace := t.tr.ReplaceOrInsert(seg)
+	var replace bool
+	prev, replace = t.tr.ReplaceOrInsert(seg)
 	if replace {
 		if log.IsLevelEnabled(log.TraceLevel) {
 			log.Tracef("%v is replaced by %v", prev, seg)
@@ -214,7 +231,7 @@ func (t *segmentTree) Insert(seg *segment) (ok bool) {
 	} else {
 		t.notifyNotEmpty()
 	}
-	return true
+	return prev, true
 }
 
 // DeleteMin removes the smallest item from the tree.

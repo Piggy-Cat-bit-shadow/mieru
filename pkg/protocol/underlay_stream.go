@@ -244,18 +244,22 @@ func (t *StreamUnderlay) RunEventLoop(ctx context.Context) error {
 			switch seg.metadata.Protocol() {
 			case openSessionRequest:
 				if err := t.onOpenSessionRequest(seg); err != nil {
+					releaseSegmentPayload(seg)
 					return fmt.Errorf("onOpenSessionRequest() failed: %w", err)
 				}
 				t.commitServerUserAuthentication(seg)
 			case openSessionResponse:
 				if err := t.onOpenSessionResponse(seg); err != nil {
+					releaseSegmentPayload(seg)
 					return fmt.Errorf("onOpenSessionResponse() failed: %w", err)
 				}
 			case closeSessionRequest, closeSessionResponse:
 				if err := t.onCloseSession(seg); err != nil {
+					releaseSegmentPayload(seg)
 					return fmt.Errorf("onCloseSession() failed: %w", err)
 				}
 			default:
+				releaseSegmentPayload(seg)
 				return fmt.Errorf("protocol %d is a session protocol but not recognized by stream underlay", seg.metadata.Protocol())
 			}
 		} else if isDataAckProtocol(seg.metadata.Protocol()) {
@@ -263,6 +267,9 @@ func (t *StreamUnderlay) RunEventLoop(ctx context.Context) error {
 			session, ok := t.sessionMap.Load(das.sessionID)
 			if !ok {
 				log.Debugf("Session %d is not registered to %v", das.sessionID, t)
+				// The payload can no longer be delivered; return its
+				// accounting before dropping it.
+				releaseSegmentPayload(seg)
 				// Request the peer to close the session.
 				closeReq := &segment{
 					metadata: &sessionStruct{
@@ -284,6 +291,7 @@ func (t *StreamUnderlay) RunEventLoop(ctx context.Context) error {
 			t.deliverSegmentToSession(session.(*Session), seg)
 		} else {
 			log.Debugf("Ignore unknown protocol %d", seg.metadata.Protocol())
+			releaseSegmentPayload(seg)
 		}
 	}
 }

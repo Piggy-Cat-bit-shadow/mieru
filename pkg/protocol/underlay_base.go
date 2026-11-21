@@ -49,6 +49,15 @@ type baseUnderlay struct {
 	mtu      int
 	done     chan struct{} // if the underlay is closed
 
+	// exclusive is true when the underlay is known to carry at most one
+	// session. Only such an underlay may pause its reader for a session's
+	// receive byte quota: on a shared underlay the same pause would stall the
+	// control and data frames of every other session.
+	exclusive bool
+	// recvQuota is the per-session payload byte receive quota copied to
+	// sessions attached to this underlay. 0 disables the quota.
+	recvQuota atomic.Int64
+
 	sessionMap     sync.Map      // Map<sessionID, *Session>
 	readySessions  chan *Session // sessions that completed handshake and ready for consume
 	trafficPattern *appctlpb.TrafficPattern
@@ -66,6 +75,12 @@ type baseUnderlay struct {
 var (
 	_ Underlay = &baseUnderlay{}
 )
+
+// receiveQuotaSetter is implemented by underlays whose live sessions accept a
+// runtime receive byte quota update.
+type receiveQuotaSetter interface {
+	setReceiveByteQuota(int64)
+}
 
 func newBaseUnderlay(isClient bool, mtu int, trafficPattern *appctlpb.TrafficPattern) *baseUnderlay {
 	return &baseUnderlay{
@@ -169,6 +184,7 @@ func (b *baseUnderlay) addSessionLocked(s *Session, remoteAddr net.Addr) error {
 	}
 	s.conn = b
 	s.remoteAddr = remoteAddr
+	s.setReceiveByteQuota(b.recvQuota.Load())
 
 	if s.isClient {
 		metrics.ActiveOpens.Add(1)
@@ -194,6 +210,9 @@ func (b *baseUnderlay) RemoveSession(s *Session) error {
 	b.sessionMap.Delete(s.id)
 	s.Close()
 	s.wg.Wait()
+	// The input loop has stopped. Drain anything that was still parked so a
+	// removed session does not retain receive payload or accounting.
+	s.closeReceive()
 	return nil
 }
 
@@ -236,16 +255,55 @@ func (b *baseUnderlay) Done() chan struct{} {
 	return b.done
 }
 
-// deliverSegmentToSession blocks for live sessions to preserve back pressure,
-// but returns when the session or underlay has been closed.
-func (b *baseUnderlay) deliverSegmentToSession(s *Session, seg *segment) bool {
-	select {
-	case s.recvChan <- seg:
+// setReceiveByteQuota updates the receive quota of this underlay and of every
+// session attached to it. A live change wakes parked receive admissions, which
+// re-check the new quota.
+func (b *baseUnderlay) setReceiveByteQuota(n int64) {
+	b.recvQuota.Store(n)
+	b.sessionMap.Range(func(k, v any) bool {
+		v.(*Session).setReceiveByteQuota(n)
 		return true
-	case <-s.closedChan:
+	})
+}
+
+// deliverSegmentToSession hands seg to the session's input loop and transfers
+// the payload accounting to the session. It blocks for live sessions to
+// preserve back pressure, but returns when the session or underlay has been
+// closed. It never holds recvMu while waiting, so Read, Close and quota
+// admission stay independent.
+func (b *baseUnderlay) deliverSegmentToSession(s *Session, seg *segment) bool {
+	if s == nil {
+		releaseSegmentPayload(seg)
 		return false
-	case <-b.done:
-		return false
+	}
+	// Count the payload at the ownership transfer. A segment that was already
+	// admitted against the byte quota is already accounted, and
+	// accountSegmentPayload is then a no-op.
+	s.accountSegmentPayload(seg)
+	for {
+		s.recvMu.Lock()
+		if s.recvClosed {
+			s.recvMu.Unlock()
+			releaseSegmentPayload(seg)
+			return false
+		}
+		select {
+		case s.recvChan <- seg:
+			s.recvMu.Unlock()
+			return true
+		default:
+		}
+		s.recvMu.Unlock()
+		select {
+		case <-s.recvChanSpace:
+			// The input loop took a segment out of recvChan.
+		case <-s.closedChan:
+			releaseSegmentPayload(seg)
+			return false
+		case <-b.done:
+			releaseSegmentPayload(seg)
+			return false
+		}
 	}
 }
 

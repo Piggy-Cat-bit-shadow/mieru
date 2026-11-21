@@ -59,6 +59,7 @@ type PacketUnderlay struct {
 }
 
 var _ Underlay = &PacketUnderlay{}
+var _ receiveQuotaSetter = &PacketUnderlay{}
 
 // NewPacketUnderlay connects to the remote address "addr" on the network
 // with packet encryption.
@@ -239,6 +240,7 @@ func (u *PacketUnderlay) RunEventLoop(ctx context.Context) error {
 			session, ok := u.sessionMap.Load(das.sessionID)
 			if !ok {
 				log.Debugf("Session %d is not registered to %v", das.sessionID, u)
+				releaseSegmentPayload(seg)
 				if u.isClient || seg.block != nil {
 					// Request the peer to close the session.
 					// Client uses u.block so it is safe when seg.block is nil.
@@ -264,6 +266,7 @@ func (u *PacketUnderlay) RunEventLoop(ctx context.Context) error {
 			u.deliverSegmentToSession(session.(*Session), seg)
 		} else {
 			log.Debugf("Ignore unknown protocol %d", seg.metadata.Protocol())
+			releaseSegmentPayload(seg)
 		}
 	}
 }
