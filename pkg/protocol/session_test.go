@@ -27,8 +27,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// TestDeliverSegmentUnblocksOnSessionClose proves the exclusive underlay keeps
+// its receive back pressure: a delivery parks on a full per-session queue and is
+// released by either the input loop taking a segment or the session closing. A
+// shared underlay must not park the reader at all; that path is covered by
+// TestSharedUnderlayOverflowFailsOnlyTheSlowSession.
 func TestDeliverSegmentUnblocksOnSessionClose(t *testing.T) {
 	underlay := newBaseUnderlay(false, 1400, nil)
+	underlay.exclusive = true
 	session := NewSession(1, false, 1400, nil, nil)
 	seg := testDataSegment(1, 1, []byte("a"), common.StreamTransport)
 

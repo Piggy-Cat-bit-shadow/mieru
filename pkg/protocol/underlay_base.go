@@ -267,10 +267,19 @@ func (b *baseUnderlay) setReceiveByteQuota(n int64) {
 }
 
 // deliverSegmentToSession hands seg to the session's input loop and transfers
-// the payload accounting to the session. It blocks for live sessions to
-// preserve back pressure, but returns when the session or underlay has been
-// closed. It never holds recvMu while waiting, so Read, Close and quota
-// admission stay independent.
+// the payload accounting to the session.
+//
+// The session's receive channel is a bounded per-session queue. On an exclusive
+// underlay a full queue may pause the reader: the underlay carries at most one
+// session, so the wait is that session's own receive back pressure and the
+// quota relies on it. A shared underlay has a single reader for all of its
+// sessions, and the same wait would stall the control and data frames of every
+// other session (head-of-line blocking), so there a full queue fails the one
+// session instead: its queued payload stays readable, its remaining reads end,
+// the peer is told to stop, and the reader returns without waiting. The
+// delivery returns when the session or underlay has been closed in both modes.
+// It never holds recvMu while waiting, so Read, Close and quota admission stay
+// independent.
 func (b *baseUnderlay) deliverSegmentToSession(s *Session, seg *segment) bool {
 	if s == nil {
 		releaseSegmentPayload(seg)
@@ -294,6 +303,13 @@ func (b *baseUnderlay) deliverSegmentToSession(s *Session, seg *segment) bool {
 		default:
 		}
 		s.recvMu.Unlock()
+		if !b.exclusive {
+			// One session's full queue may not stall the reader that every
+			// other session on this underlay depends on.
+			s.failReceiveOverflow()
+			releaseSegmentPayload(seg)
+			return false
+		}
 		select {
 		case <-s.recvChanSpace:
 			// The input loop took a segment out of recvChan.

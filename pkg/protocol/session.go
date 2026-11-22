@@ -189,6 +189,10 @@ type Session struct {
 	// can't deadlock Read or Close.
 	recvMu     sync.Mutex
 	recvClosed bool
+	// recvOverflowOnce makes the "receive queue is full on a shared underlay"
+	// transition happen once, even when the reader keeps meeting the session
+	// until it is removed from the session map.
+	recvOverflowOnce sync.Once
 
 	rttStat            *congestion.RTTStats
 	cubicSendAlgorithm *congestion.CubicSendAlgorithm
@@ -1662,6 +1666,29 @@ func (s *Session) closeReceive() {
 			return
 		}
 	}
+}
+
+// failReceiveOverflow ends a session that can no longer accept a received
+// segment while it shares its underlay reader with other sessions.
+//
+// The receive path calls it instead of waiting for queue space: the queue only
+// fills when the application has stopped consuming, and waiting there would
+// block the single reader of a shared stream or packet underlay and stall every
+// other session. Closing is the only non-lossy overload policy for a stream
+// session, because the underlay carries no per-session flow control that could
+// tell the peer to stop sending without closing the session.
+//
+// The close runs in its own goroutine because it may write a close request to
+// the peer; the reader must never wait for that write. Payload that is already
+// in recvQueue stays readable, exactly like a normal Close, and the bounded
+// receive queues stop growing as soon as this method returns.
+func (s *Session) failReceiveOverflow() {
+	s.recvOverflowOnce.Do(func() {
+		log.Debugf("%v receive queue is full on a shared underlay; closing the session", s)
+		go func() {
+			_ = s.closeWithError(fmt.Errorf("receive queue is full on a shared underlay"))
+		}()
+	})
 }
 
 // sendWindowSize determines how many more packets this session can send.
