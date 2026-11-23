@@ -96,6 +96,25 @@ func (c *EarlyConn) Close() error {
 	return c.Conn.Close()
 }
 
+// CloseWrite ends the write direction of the underlying connection. It
+// performs the deferred handshake first if the application never wrote
+// anything, so the peer still learns the request and the connection is left
+// in a state it can understand.
+func (c *EarlyConn) CloseWrite() error {
+	c.handshakeOnce.Do(func() {
+		c.handshakeErr = c.doHandshakeAndWrite(nil)
+		close(c.handshaked)
+	})
+	if c.handshakeErr != nil {
+		return c.handshakeErr
+	}
+	writeCloser, ok := c.Conn.(interface{ CloseWrite() error })
+	if !ok {
+		return fmt.Errorf("underlying connection does not support CloseWrite")
+	}
+	return writeCloser.CloseWrite()
+}
+
 // NeedHandshake returns true if the handshake has not been performed yet.
 func (c *EarlyConn) NeedHandshake() bool {
 	select {

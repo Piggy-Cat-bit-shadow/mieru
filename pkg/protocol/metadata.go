@@ -76,6 +76,36 @@ func (p protocolType) String() string {
 	}
 }
 
+// Flags carried in byte 1 of a sessionStruct.
+//
+// Byte 1 of a sessionStruct is documented as reserved. A peer that predates
+// these flags ignores it, both when it decodes the metadata and when it
+// dispatches the message, so a flag can only be read by a peer that was
+// updated to look for it. That is why a write-end capability is advertised in
+// the open session message and a write-end frame is only sent after the peer
+// advertised the same capability: no peer ever receives a flag it does not
+// understand the meaning of.
+const (
+	// sessionFlagWriteEndCapable advertises that the sender understands a
+	// write-end data frame (dataFlagWriteEnd) and will turn one received from
+	// the peer into io.EOF on Read, without closing the reverse direction.
+	sessionFlagWriteEndCapable uint8 = 1 << 0
+)
+
+// Flags carried in byte 1 of a non-low-entropy dataAckStruct.
+//
+// Byte 1 of a dataAckStruct is the low entropy mode for a low entropy data
+// frame and is reserved for the other data and ACK frames. A write-end frame
+// is therefore always sent with a non-low-entropy protocol, where old
+// receivers ignore byte 1 and see an ordinary empty data frame.
+const (
+	// dataFlagWriteEnd marks an empty data frame that ends the sender's write
+	// direction. Every payload segment the sender wrote before it has a
+	// smaller sequence number, and the sender will not write payload with a
+	// larger one.
+	dataFlagWriteEnd uint8 = 1 << 0
+)
+
 type statusCode byte
 
 const (
@@ -126,7 +156,7 @@ var (
 // baseStruct is shared by all metadata struct.
 type baseStruct struct {
 	protocol  uint8  // byte 0: protocol type
-	_         uint8  // byte 1: type-specific; low entropy mode for low entropy data, otherwise reserved
+	flags     uint8  // byte 1: type-specific; low entropy mode for low entropy data, otherwise reserved
 	timestamp uint32 // byte 2 - 5: timestamp, number of minutes after UNIX epoch
 }
 
@@ -147,6 +177,7 @@ func (ss *sessionStruct) Protocol() protocolType {
 func (ss *sessionStruct) Marshal() []byte {
 	b := make([]byte, MetadataLength)
 	b[0] = ss.baseStruct.protocol
+	b[1] = ss.baseStruct.flags
 	ss.baseStruct.timestamp = uint32(time.Now().Unix() / 60)
 	binary.BigEndian.PutUint32(b[2:], ss.baseStruct.timestamp)
 	binary.BigEndian.PutUint32(b[6:], ss.sessionID)
@@ -177,6 +208,7 @@ func (ss *sessionStruct) Unmarshal(b []byte) error {
 
 	// Do unmarshal.
 	ss.baseStruct.protocol = b[0]
+	ss.baseStruct.flags = b[1]
 	ss.baseStruct.timestamp = originalTimestamp
 	ss.sessionID = binary.BigEndian.Uint32(b[6:])
 	ss.seq = binary.BigEndian.Uint32(b[10:])
@@ -187,7 +219,7 @@ func (ss *sessionStruct) Unmarshal(b []byte) error {
 }
 
 func (ss *sessionStruct) String() string {
-	return fmt.Sprintf("sessionStruct{protocol=%v, sessionID=%v, seq=%v, statusCode=%v, payloadLen=%v, suffixLen=%v}", protocolType(ss.protocol), ss.sessionID, ss.seq, ss.statusCode, ss.payloadLen, ss.suffixLen)
+	return fmt.Sprintf("sessionStruct{protocol=%v, flags=%v, sessionID=%v, seq=%v, statusCode=%v, payloadLen=%v, suffixLen=%v}", protocolType(ss.protocol), ss.flags, ss.sessionID, ss.seq, ss.statusCode, ss.payloadLen, ss.suffixLen)
 }
 
 func isSessionProtocol(p protocolType) bool {
@@ -227,6 +259,8 @@ func (das *dataAckStruct) Marshal() []byte {
 	b[0] = das.baseStruct.protocol
 	if isLowEntropyProtocol(das.Protocol()) {
 		b[1] = das.lowEntropyMode
+	} else {
+		b[1] = das.baseStruct.flags
 	}
 	das.baseStruct.timestamp = uint32(time.Now().Unix() / 60)
 	binary.BigEndian.PutUint32(b[2:], das.baseStruct.timestamp)
@@ -262,6 +296,7 @@ func (das *dataAckStruct) Unmarshal(b []byte) error {
 	}
 
 	var lowEntropyMode uint8
+	var flags uint8
 	var lowEntropyMask uint32
 	var extractedPayloadLen uint16
 	var lowEntropyMaskRotation uint8
@@ -281,10 +316,13 @@ func (das *dataAckStruct) Unmarshal(b []byte) error {
 		if err := validateLowEntropyDataAckMetadata(candidate); err != nil {
 			return err
 		}
+	} else {
+		flags = b[1]
 	}
 
 	// Do unmarshal.
 	das.baseStruct.protocol = uint8(protocol)
+	das.baseStruct.flags = flags
 	das.baseStruct.timestamp = originalTimestamp
 	das.lowEntropyMode = lowEntropyMode
 	das.sessionID = binary.BigEndian.Uint32(b[6:])
@@ -302,7 +340,7 @@ func (das *dataAckStruct) Unmarshal(b []byte) error {
 }
 
 func (das *dataAckStruct) String() string {
-	result := fmt.Sprintf("dataAckStruct{protocol=%v, sessionID=%v, seq=%v, unAckSeq=%v, windowSize=%v, fragment=%v, prefixLen=%v, payloadLen=%v, suffixLen=%v", protocolType(das.protocol), das.sessionID, das.seq, das.unAckSeq, das.windowSize, das.fragment, das.prefixLen, das.payloadLen, das.suffixLen)
+	result := fmt.Sprintf("dataAckStruct{protocol=%v, flags=%v, sessionID=%v, seq=%v, unAckSeq=%v, windowSize=%v, fragment=%v, prefixLen=%v, payloadLen=%v, suffixLen=%v", protocolType(das.protocol), das.flags, das.sessionID, das.seq, das.unAckSeq, das.windowSize, das.fragment, das.prefixLen, das.payloadLen, das.suffixLen)
 	if das.lowEntropyMode == uint8(appctlpb.LowEntropyMode_LOW_ENTROPY_MODE_OFF) {
 		return result + "}"
 	}

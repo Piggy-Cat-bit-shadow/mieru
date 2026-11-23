@@ -81,6 +81,14 @@ const (
 	// share a single ACK, which bounds the ACK rate.
 	packetAckDelay = 1 * time.Millisecond
 
+	// writeEndHandshakeTimeout bounds how long CloseWrite waits for the peer's
+	// open session message when that message has not arrived yet. The wait is
+	// normally one network round trip: a client that reaches EOF before the
+	// server's open session response was processed still has to learn whether
+	// the server understands a write-end frame. Without a bound, a peer that
+	// stopped answering would park the write side of a flow forever.
+	writeEndHandshakeTimeout = 5 * time.Second
+
 	// retransmissionCheckDelay is the time to wait before the first
 	// retransmission check after new segments are sent into an empty
 	// send buffer.
@@ -94,6 +102,20 @@ const (
 	txTimeoutBackOff = 1.5
 	// Maximum back off duration.
 	maxBackOffDuration = 10 * time.Second
+)
+
+var (
+	// ErrWriteEndUnsupported is returned by CloseWrite when the peer did not
+	// advertise support for a write-end frame in its open session message,
+	// which is what an older mieru peer does. Nothing was sent and the
+	// session is untouched, so the caller can fall back to Close.
+	ErrWriteEndUnsupported = fmt.Errorf("peer does not support ending the write direction")
+
+	// ErrWriteEndTimeout is returned by CloseWrite when the peer's open
+	// session message did not arrive within writeEndHandshakeTimeout (or the
+	// session's write deadline, if earlier). Nothing was sent and the session
+	// is untouched.
+	ErrWriteEndTimeout = fmt.Errorf("timeout waiting for the peer to negotiate the write direction")
 )
 
 type sessionState int32
@@ -144,6 +166,27 @@ type Session struct {
 	inputErr       chan error    // this channel is closed when input has error
 	outputHasErr   atomic.Bool   // output has error
 	outputErr      chan error    // this channel is closed when output has error
+
+	// writeEndSent is true after CloseWrite enqueued the write-end frame.
+	// It is only accessed while wLock is held, which is the same lock that
+	// serializes Write, so "no payload after the write end" needs no other
+	// synchronization.
+	writeEndSent bool
+	// peerWriteEndCapable records that the peer advertised support for the
+	// write-end frame in its open session message.
+	peerWriteEndCapable atomic.Bool
+	// peerCapabilityKnown is closed once the peer's open session message has
+	// been processed, whether or not it advertised the capability.
+	peerCapabilityKnown chan struct{}
+	peerCapabilityOnce  sync.Once
+	// readWriteEnd is set when the peer's write-end frame has been consumed
+	// by Read. From then on Read returns io.EOF.
+	readWriteEnd atomic.Bool
+	// recvWriteEnded is set under recvMu when the peer's write-end frame was
+	// consumed. Receive segments that arrive afterwards are dropped instead of
+	// queued, so payload the application will never read cannot stay accounted
+	// against the receive quota.
+	recvWriteEnded bool
 
 	sendQueue *segmentTree  // segments waiting to send
 	sendBuf   *segmentTree  // segments sent but not acknowledged
@@ -252,6 +295,7 @@ func newSessionWithServerUserPolicy(
 		closedChan:                make(chan struct{}),
 		inputErr:                  make(chan error),
 		outputErr:                 make(chan error),
+		peerCapabilityKnown:       make(chan struct{}),
 		sendQueue:                 newSegmentTree(segmentSendQueueTreeCapacity),
 		sendBuf:                   newSegmentTree(segmentTreeCapacity),
 		recvBuf:                   newSegmentTree(segmentTreeCapacity),
@@ -444,6 +488,17 @@ func (s *Session) Read(b []byte) (n int, err error) {
 			}
 		}
 
+		if s.readWriteEnd.Load() {
+			// The peer ended its write direction and everything it wrote
+			// before that has already been returned. A read that copied bytes
+			// in this call still reports them; the EOF follows on the next
+			// call, which is the ordinary io.Reader contract.
+			if n > 0 {
+				break
+			}
+			return 0, io.EOF
+		}
+
 		if s.recvQueue.Len() > 0 {
 			// Read segments from recv queue.
 			seg, ok := s.recvQueue.DeleteMin()
@@ -452,6 +507,14 @@ func (s *Session) Read(b []byte) (n int, err error) {
 			}
 			if s.isClient && seg.metadata.Protocol() == openSessionResponse && s.isState(sessionAttached) {
 				s.forwardStateTo(sessionEstablished)
+			}
+			if isWriteEndSegment(seg) {
+				releaseSegmentPayload(seg)
+				s.consumeWriteEnd()
+				if n > 0 {
+					break
+				}
+				return 0, io.EOF
 			}
 			// Segments inserted by the receive path are already accounted;
 			// this also accounts segments inserted directly by tests.
@@ -507,6 +570,12 @@ func (s *Session) Write(b []byte) (n int, err error) {
 	if s.closeRequested.Load() {
 		return 0, io.ErrClosedPipe
 	}
+	// CloseWrite ended the write direction. This is checked while holding
+	// wLock, the same lock CloseWrite uses, so a payload segment can never
+	// get a sequence number larger than the write-end frame.
+	if s.writeEndSent {
+		return 0, io.ErrClosedPipe
+	}
 
 	if s.isStateBefore(sessionAttached, false) {
 		return 0, fmt.Errorf("%v is not ready for Write()", s)
@@ -526,6 +595,7 @@ func (s *Session) Write(b []byte) (n int, err error) {
 			metadata: &sessionStruct{
 				baseStruct: baseStruct{
 					protocol: uint8(openSessionRequest),
+					flags:    sessionFlagWriteEndCapable,
 				},
 				sessionID: s.id,
 				seq:       s.nextSend.Load(),
@@ -578,6 +648,240 @@ func (s *Session) Write(b []byte) (n int, err error) {
 // Close terminates the session.
 func (s *Session) Close() error {
 	return s.closeWithError(nil)
+}
+
+// CloseWrite ends the write direction of the session without closing the read
+// direction, like a TCP half close (shutdown(SHUT_WR)).
+//
+// After CloseWrite returns nil, Write fails with io.ErrClosedPipe, every
+// payload segment written before the call is still delivered to the peer in
+// order, and then the peer observes io.EOF from Read. The peer's own writes
+// keep arriving until the peer ends its write direction or the session is
+// closed. CloseWrite does not wait for the peer to acknowledge the write end.
+//
+// The write end is carried by a data frame with the reserved metadata byte set
+// to dataFlagWriteEnd, so it uses the same sequence numbers, ordering,
+// retransmission and acknowledgement as payload. It is only sent to a peer
+// that advertised sessionFlagWriteEndCapable in its open session message,
+// because a peer that predates the flag would parse the frame as an ordinary
+// empty data frame and would never end its Read. When the peer did not
+// advertise the capability, CloseWrite returns ErrWriteEndUnsupported and
+// leaves the session untouched, so the caller can fall back to Close (the
+// behaviour of every mieru version before this one).
+//
+// CloseWrite is idempotent. It is safe to call concurrently with Close, which
+// unblocks a pending capability wait and makes CloseWrite fail with
+// io.ErrClosedPipe rather than hang.
+func (s *Session) CloseWrite() error {
+	s.wLock.Lock()
+	defer s.wLock.Unlock()
+
+	if s.closeRequested.Load() {
+		return io.ErrClosedPipe
+	}
+	if s.writeEndSent {
+		return nil
+	}
+	if s.isStateBefore(sessionAttached, false) {
+		return fmt.Errorf("%v is not ready for CloseWrite()", s)
+	}
+	if s.isStateAfter(sessionClosed, true) {
+		return io.ErrClosedPipe
+	}
+
+	// A client sends the open session request with its first write. CloseWrite
+	// may be the first thing the session is asked to do - an empty request
+	// that the destination still has to answer - and the request is also what
+	// advertises this client's write-end support, so make sure it is on its
+	// way before waiting for the server's answer.
+	if s.isClient && !s.openSessionRequestSent.Swap(true) {
+		if err := s.waitSendQueueSlot(); err != nil {
+			return err
+		}
+		s.oLock.Lock()
+		seg := &segment{
+			metadata: &sessionStruct{
+				baseStruct: baseStruct{
+					protocol: uint8(openSessionRequest),
+					flags:    sessionFlagWriteEndCapable,
+				},
+				sessionID: s.id,
+				seq:       s.nextSend.Load(),
+			},
+			transport: s.transportProtocol,
+		}
+		s.nextSend.Add(1)
+		inserted := s.sendQueue.Insert(seg)
+		s.oLock.Unlock()
+		if !inserted {
+			return fmt.Errorf("insert %v to send queue failed", seg)
+		}
+	}
+
+	if err := s.waitPeerWriteEndCapability(); err != nil {
+		return err
+	}
+	if !s.peerWriteEndCapable.Load() {
+		return ErrWriteEndUnsupported
+	}
+	if err := s.enqueueWriteEndLocked(); err != nil {
+		return err
+	}
+	s.writeEndSent = true
+	return nil
+}
+
+// waitPeerWriteEndCapability waits until the peer's open session message has
+// been processed. It returns as soon as that message was seen, even if the
+// peer did not advertise the capability; the caller reads
+// peerWriteEndCapable to tell the two apart.
+func (s *Session) waitPeerWriteEndCapability() error {
+	select {
+	case <-s.peerCapabilityKnown:
+		return nil
+	default:
+	}
+
+	wait := writeEndHandshakeTimeout
+	if writeDeadline := s.writeDeadline.Load(); writeDeadline != 0 {
+		if remaining := time.Until(time.UnixMicro(writeDeadline)); remaining < wait {
+			wait = remaining
+		}
+	}
+	if wait <= 0 {
+		return ErrWriteEndTimeout
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-s.peerCapabilityKnown:
+		return nil
+	case <-s.closedChan:
+		return io.ErrClosedPipe
+	case <-s.outputErr:
+		return io.ErrClosedPipe
+	case <-timer.C:
+		return ErrWriteEndTimeout
+	}
+}
+
+// waitSendQueueSlot waits until one send queue slot is free while keeping the
+// write deadline and a session close effective. It is the CloseWrite analogue
+// of the back pressure in writeChunk, without a payload to split.
+func (s *Session) waitSendQueueSlot() error {
+	var timeC <-chan time.Time
+	if writeDeadline := s.writeDeadline.Load(); writeDeadline != 0 {
+		timeC = time.After(time.Until(time.UnixMicro(writeDeadline)))
+	}
+	for s.sendQueue.Remaining() <= 1 {
+		select {
+		case <-s.closedChan:
+			return io.ErrClosedPipe
+		case <-s.outputErr:
+			return io.ErrClosedPipe
+		case <-timeC:
+			return stderror.ErrTimeout
+		default:
+		}
+		time.Sleep(backPressureDelay)
+	}
+	return nil
+}
+
+// enqueueWriteEndLocked inserts the write-end frame. The caller must hold
+// wLock, which guarantees that no payload segment with a larger sequence
+// number can be created afterwards.
+func (s *Session) enqueueWriteEndLocked() error {
+	if err := s.waitSendQueueSlot(); err != nil {
+		return err
+	}
+
+	var protocol protocolType
+	if s.isClient {
+		protocol = dataClientToServer
+	} else {
+		protocol = dataServerToClient
+	}
+	s.oLock.Lock()
+	defer s.oLock.Unlock()
+	// The frame is always sent with a non-low-entropy protocol: byte 1 of a
+	// low entropy data frame is the mode, not a flag byte, and an empty plain
+	// data frame is valid whichever encoding the rest of the session uses.
+	// A pre-extension receiver ignores byte 1 and parses it as an ordinary
+	// empty data frame, which is why it is only ever sent after negotiation.
+	das := &dataAckStruct{
+		baseStruct: baseStruct{
+			protocol: uint8(protocol),
+			flags:    dataFlagWriteEnd,
+		},
+		sessionID:  s.id,
+		seq:        s.nextSend.Load(),
+		unAckSeq:   s.nextRecv.Load(),
+		windowSize: uint16(s.receiveWindowSize()),
+	}
+	seg := &segment{
+		metadata:  das,
+		transport: s.transportProtocol,
+	}
+	s.nextSend.Add(1)
+	if !s.sendQueue.Insert(seg) {
+		return fmt.Errorf("insert %v to send queue failed", seg)
+	}
+	return nil
+}
+
+// notePeerSessionFlags records what the peer's open session message says about
+// its write-end support. It is called for every open session message, so a
+// client learns the server's support from the response and a server learns the
+// client's support from the request.
+func (s *Session) notePeerSessionFlags(flags uint8) {
+	if flags&sessionFlagWriteEndCapable != 0 {
+		s.peerWriteEndCapable.Store(true)
+	}
+	s.peerCapabilityOnce.Do(func() {
+		close(s.peerCapabilityKnown)
+	})
+}
+
+// isWriteEndSegment reports whether seg is the peer's write-end frame.
+func isWriteEndSegment(seg *segment) bool {
+	if seg == nil || !isDataProtocol(seg.Protocol()) {
+		return false
+	}
+	das, ok := toDataAckStruct(seg.metadata)
+	return ok && das.baseStruct.flags&dataFlagWriteEnd != 0
+}
+
+// consumeWriteEnd makes the read direction return io.EOF from now on, and
+// drops any segment the peer queued after the write end. The write end is the
+// smallest sequence number left in the receive path at this point, because
+// Read returns payload in order, so anything still queued is a protocol
+// violation the application can never read. Dropping it returns its receive
+// quota instead of keeping payload alive forever.
+func (s *Session) consumeWriteEnd() {
+	s.readWriteEnd.Store(true)
+	s.recvMu.Lock()
+	defer s.recvMu.Unlock()
+	if s.recvWriteEnded {
+		return
+	}
+	s.recvWriteEnded = true
+	for {
+		seg, ok := s.recvQueue.DeleteMin()
+		if !ok {
+			break
+		}
+		releaseSegmentPayload(seg)
+	}
+	var orphaned []*segment
+	s.recvBuf.Ascend(func(iter *segment) bool {
+		orphaned = append(orphaned, iter)
+		return true
+	})
+	s.recvBuf.DeleteAll()
+	for _, seg := range orphaned {
+		releaseSegmentPayload(seg)
+	}
 }
 
 func (s *Session) LocalAddr() net.Addr {
@@ -1235,6 +1539,17 @@ func (s *Session) input(seg *segment) error {
 		}
 	}
 
+	// The open session message carries the peer's write-end capability in the
+	// reserved metadata byte. It is processed before the message is dispatched
+	// so CloseWrite never races the answer it is waiting for, and it is
+	// accepted from an old peer too: an old peer leaves the byte zero, which
+	// means "no capability" rather than an error.
+	if ss, ok := toSessionStruct(seg.metadata); ok {
+		if seg.Protocol() == openSessionRequest || seg.Protocol() == openSessionResponse {
+			s.notePeerSessionFlags(ss.flags)
+		}
+	}
+
 	if seg.block != nil {
 		// Validate cipher block user name is consistent.
 		if s.block.Load() != nil {
@@ -1318,6 +1633,13 @@ func (s *Session) inputData(seg *segment) error {
 	// From this point on the segment payload is owned by the session. Every
 	// exit path either parks it in a receive container or releases it.
 	s.accountSegmentPayload(seg)
+	if isWriteEndSegment(seg) && len(seg.payload) != 0 {
+		// A write-end frame is the end of the payload stream. Accepting a
+		// payload here would either deliver bytes after EOF or leak their
+		// accounting, so the frame is rejected as malformed.
+		releaseSegmentPayload(seg)
+		return fmt.Errorf("inputData() failed: write end frame carries %d payload bytes", len(seg.payload))
+	}
 	switch s.transportProtocol {
 	case common.StreamTransport:
 		// Wait outside recvMu: Close must always be able to take the lock.
@@ -1329,6 +1651,14 @@ func (s *Session) inputData(seg *segment) error {
 		}
 		s.recvMu.Lock()
 		if s.recvClosed {
+			s.recvMu.Unlock()
+			releaseSegmentPayload(seg)
+			return nil
+		}
+		if s.recvWriteEnded {
+			// The peer ended its write direction and Read already returned
+			// io.EOF. A segment after it is a protocol violation; dropping it
+			// keeps it from holding receive quota forever.
 			s.recvMu.Unlock()
 			releaseSegmentPayload(seg)
 			return nil
@@ -1376,6 +1706,14 @@ func (s *Session) inputData(seg *segment) error {
 		hasRecvQueueSpace := s.waitForRecvQueueSpace()
 		s.recvMu.Lock()
 		if s.recvClosed {
+			s.recvMu.Unlock()
+			releaseSegmentPayload(seg)
+			return nil
+		}
+		if s.recvWriteEnded {
+			// The peer ended its write direction and Read already returned
+			// io.EOF. A segment after it is a protocol violation; dropping it
+			// keeps it from holding receive quota forever.
 			s.recvMu.Unlock()
 			releaseSegmentPayload(seg)
 			return nil
@@ -1435,6 +1773,11 @@ func (s *Session) inputData(seg *segment) error {
 				metadata: &sessionStruct{
 					baseStruct: baseStruct{
 						protocol: uint8(openSessionResponse),
+						// Advertise this server's write-end support. A client
+						// that predates the flag ignores the reserved byte;
+						// this server still never sends it a write end because
+						// such a client did not advertise support itself.
+						flags: sessionFlagWriteEndCapable,
 					},
 					sessionID: s.id,
 					seq:       s.nextSend.Load(),
