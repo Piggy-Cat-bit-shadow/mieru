@@ -156,6 +156,15 @@ func (u *PacketUnderlay) AddSession(s *Session, remoteAddr net.Addr) error {
 	// or a teardown can observe a half-attached session.
 	u.closeMutex.Lock()
 	defer u.closeMutex.Unlock()
+	return u.addSessionLocked(s, remoteAddr)
+}
+
+// addSessionLocked attaches and starts a session while the caller holds closeMutex.
+//
+// onOpenSessionRequest already holds the lock to keep the accept slot reserved until dispatch,
+// so it must call this variant: calling AddSession from inside that region self-deadlocks on the
+// non-reentrant closeMutex (the packet underlay did exactly that before this split).
+func (u *PacketUnderlay) addSessionLocked(s *Session, remoteAddr net.Addr) error {
 	if err := u.baseUnderlay.addSessionLocked(s, remoteAddr); err != nil {
 		return err
 	}
@@ -180,7 +189,6 @@ func (u *PacketUnderlay) AddSession(s *Session, remoteAddr net.Addr) error {
 	}()
 	return nil
 }
-
 func (u *PacketUnderlay) RunEventLoop(ctx context.Context) error {
 	if u.conn == nil {
 		return stderror.ErrNullPointer
@@ -308,7 +316,7 @@ func (u *PacketUnderlay) onOpenSessionRequest(seg *segment, remoteAddr net.Addr)
 		return fmt.Errorf("session accept backlog is full: %w", stderror.ErrNotReady)
 	}
 	session := newSessionWithServerUserPolicy(sessionID, false, u.MTU(), seg.serverUserPolicy, nil, u.trafficPattern)
-	if err := u.AddSession(session, remoteAddr); err != nil {
+	if err := u.addSessionLocked(session, remoteAddr); err != nil {
 		return err
 	}
 	if !u.deliverSegmentToSession(session, seg) {
