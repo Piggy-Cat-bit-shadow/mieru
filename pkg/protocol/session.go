@@ -254,8 +254,8 @@ type Session struct {
 	userPolicy                atomic.Pointer[serveruser.Policy] // matched immutable policy snapshot
 	pendingServerUserPolicies map[string]serveruser.Policy      // policy of all users; released after user identity is known
 	clientUseLowEntropy       atomic.Bool                       // whether the server received low entropy data from client
-	uploadBytes               metrics.Metric                    // number of bytes from client to server
-	downloadBytes             metrics.Metric                    // number of bytes from server to client
+	uploadBytes               atomic.Pointer[metrics.Metric]    // number of bytes from client to server
+	downloadBytes             atomic.Pointer[metrics.Metric]    // number of bytes from server to client
 }
 
 var (
@@ -556,8 +556,8 @@ func (s *Session) Read(b []byte) (n int, err error) {
 	if log.IsLevelEnabled(log.TraceLevel) {
 		log.Tracef("%v read %d bytes", s, n)
 	}
-	if !s.isClient && s.uploadBytes != nil {
-		s.uploadBytes.Add(int64(n))
+	if m := s.uploadBytes.Load(); !s.isClient && m != nil {
+		(*m).Add(int64(n))
 	}
 	return n, nil
 }
@@ -639,8 +639,8 @@ func (s *Session) Write(b []byte) (n int, err error) {
 	if log.IsLevelEnabled(log.TraceLevel) {
 		log.Tracef("%v wrote %d bytes", s, n)
 	}
-	if !s.isClient && s.downloadBytes != nil {
-		s.downloadBytes.Add(int64(n))
+	if m := s.downloadBytes.Load(); !s.isClient && m != nil {
+		(*m).Add(int64(n))
 	}
 	return n, nil
 }
@@ -1028,6 +1028,10 @@ func (s *Session) isClientPacketSessionOpening() bool {
 
 func (s *Session) isClientPacketSessionOpenResponse(seg *segment) bool {
 	return s.isClientPacketSessionOpening() && seg.Protocol() == openSessionResponse
+}
+
+func (s *Session) isClientPacketSessionOpenedByData(seg *segment) bool {
+	return s.isClientPacketSessionOpening() && isDataProtocol(seg.Protocol())
 }
 
 // shouldDeferNextPacketData reports whether the next queued packet is data
@@ -1592,13 +1596,17 @@ func (s *Session) input(seg *segment) error {
 			s.userName.Store(&userName)
 		}
 
-		// Register server per user metrics.
+		// Register server per user metrics. The application may already be
+		// reading and writing the session in another goroutine: the server's
+		// Accept can return before the input loop gets here.
 		if !s.isClient {
-			if s.uploadBytes == nil {
-				s.uploadBytes = metrics.RegisterMetric(fmt.Sprintf(metrics.UserMetricGroupFormat, (*s.block.Load()).BlockContext().UserName), metrics.UserMetricUploadBytes, metrics.COUNTER_TIME_SERIES)
+			if s.uploadBytes.Load() == nil {
+				m := metrics.RegisterMetric(fmt.Sprintf(metrics.UserMetricGroupFormat, (*s.block.Load()).BlockContext().UserName), metrics.UserMetricUploadBytes, metrics.COUNTER_TIME_SERIES)
+				s.uploadBytes.Store(&m)
 			}
-			if s.downloadBytes == nil {
-				s.downloadBytes = metrics.RegisterMetric(fmt.Sprintf(metrics.UserMetricGroupFormat, (*s.block.Load()).BlockContext().UserName), metrics.UserMetricDownloadBytes, metrics.COUNTER_TIME_SERIES)
+			if s.downloadBytes.Load() == nil {
+				m := metrics.RegisterMetric(fmt.Sprintf(metrics.UserMetricGroupFormat, (*s.block.Load()).BlockContext().UserName), metrics.UserMetricDownloadBytes, metrics.COUNTER_TIME_SERIES)
+				s.downloadBytes.Store(&m)
 			}
 		}
 	}
@@ -1611,7 +1619,10 @@ func (s *Session) input(seg *segment) error {
 		if err := s.inputData(seg); err != nil {
 			return err
 		}
-		if s.isClientPacketSessionOpenResponse(seg) {
+		// In UDP transport, to relax packet sequence requirement, client considers session as established when
+		// 1. the server sends an explicit openSessionResponse, or
+		// 2. the server sends a data segment which implies the session is established at the server side
+		if s.isClientPacketSessionOpenResponse(seg) || s.isClientPacketSessionOpenedByData(seg) {
 			s.forwardStateTo(sessionEstablished)
 			s.wakePacketOutput()
 		}

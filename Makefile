@@ -37,12 +37,15 @@ FUZZ_PACKAGES ?= ./pkg/protocol
 # - pkg/version/current.go
 #
 # Use `tools/bump_version.sh` script to change all those files at one shot.
-VERSION="3.39.0"
+VERSION="3.40.0"
 
 # With .ONESHELL, each recipe is executed in a single shell instance.
 # This allows `cd` to affect subsequent commands in the same recipe.
 # .ONESHELL is supported in GNU Make version 3.82 and later.
 .ONESHELL:
+
+# Stop the recipe when a command fails.
+.SHELLFLAGS := -ec
 
 # Build binaries and installation packages.
 .PHONY: build
@@ -84,7 +87,6 @@ bench:
 # Run fuzz tests.
 .PHONY: fuzz
 fuzz:
-	set -e
 	for pkg in ${FUZZ_PACKAGES}; do
 		fuzz_tests=$$(CGO_ENABLED=0 go test -list='^Fuzz' "$$pkg")
 		for fuzz_test in $$fuzz_tests; do

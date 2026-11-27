@@ -1,5 +1,9 @@
+# The Go release binaries are already stripped and don't contain debug info.
+%global debug_package %{nil}
+%global __strip /bin/true
+
 Name: mita
-Version: 3.39.0
+Version: 3.40.0
 Release: 1%{?dist}
 Summary: Mieru proxy server
 License: GPLv3+

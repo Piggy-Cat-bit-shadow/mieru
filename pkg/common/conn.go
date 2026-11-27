@@ -48,25 +48,34 @@ func NewIdleTrackingConn(conn net.Conn) *IdleTrackingConn {
 	return c
 }
 
-// IdleTrackingConn records transport activity and can close the connection
-// when it is idle.
+// IdleTrackingConn tracks transport activity and bytes transferred. It can
+// close the connection when it is idle.
 type IdleTrackingConn struct {
 	net.Conn
 	mu           sync.Mutex
 	clock        Clock
 	lastActivity time.Time
+	readBytes    int64
+	writtenBytes int64
 }
 
 func (c *IdleTrackingConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	c.recordActivity(n)
+	c.recordRead(n)
 	return n, err
 }
 
 func (c *IdleTrackingConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
-	c.recordActivity(n)
+	c.recordWrite(n)
 	return n, err
+}
+
+// ByteCounts returns the bytes read from and written to the connection.
+func (c *IdleTrackingConn) ByteCounts() (read, written int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readBytes, c.writtenBytes
 }
 
 // CloseIfIdle closes the connection if there is no read or write within
@@ -81,9 +90,19 @@ func (c *IdleTrackingConn) CloseIfIdle(timeout time.Duration) bool {
 	return true
 }
 
-func (c *IdleTrackingConn) recordActivity(n int) {
+func (c *IdleTrackingConn) recordRead(n int) {
 	if n > 0 {
 		c.mu.Lock()
+		c.readBytes += int64(n)
+		c.lastActivity = c.clock.Now()
+		c.mu.Unlock()
+	}
+}
+
+func (c *IdleTrackingConn) recordWrite(n int) {
+	if n > 0 {
+		c.mu.Lock()
+		c.writtenBytes += int64(n)
 		c.lastActivity = c.clock.Now()
 		c.mu.Unlock()
 	}
